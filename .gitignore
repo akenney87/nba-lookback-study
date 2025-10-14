@@ -1,0 +1,9 @@
+.Rhistory
+.Rproj.user/
+.Rdata
+.Ruserdata
+renv/library/
+output/*-cache/
+*_cache/
+cache/
+.DS_Store
