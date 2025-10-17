@@ -1,0 +1,1156 @@
+---
+title: "NBA Per-36 Projection Pipeline (Steps 1–4)"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+params:
+  per36_csv: "data/Per36Minutes.csv"
+  career_csv: "data/PlayerCareerInfo.csv"
+  target_season: 2026
+editor_options:
+  chunk_output_type: console
+---
+
+# Introduction
+
+Basketball analytics has advanced beyond simple counting stats — today’s analysts use historical data and predictive modeling to forecast player performance and assess team-building strategy.  
+
+This project aims to **predict year-over-year changes in NBA player per-36-minute statistics** (PTS, REB, AST, STL, BLK, TOV, etc.) using several lightweight, interpretable modeling methods.  
+
+The central question:
+> *Which projection method best captures next-season player performance given up to five years of historical data?*
+
+We evaluate three approaches:
+- **Equal weighting** (simple average)
+- **Exponential weighting** (recency emphasis)
+- **Linear regression** (trend-based prediction)
+
+Each method is tested across major per-36 statistics using walk-forward validation, and model performance is compared using **relative Root Mean Squared Error (relRMSE)** — a normalized measure of prediction accuracy.
+
+---
+
+# Data Source and Quality
+
+All player data was sourced from **Kaggle** — specifically, the *NBA Player Stats Per 36 Minutes by Season* dataset.  
+It holds a **10/10 usability rating**, reflecting:
+- Clean, well-documented column naming conventions,
+- Consistent formatting across seasons,
+- Comprehensive coverage of NBA players and key performance metrics.
+
+Columns include:
+- `player`, `season`, `team`, `age`, `mp` (minutes)
+- Per-36-minute statistics (e.g., `pts_per_36_min`, `ast_per_36_min`, etc.)
+
+Before modeling, the data is cleaned and merged to ensure that each player-season observation is unique and complete.
+
+---
+
+# Problem Statement and Methodology
+
+## Objective
+
+To determine **which projection method minimizes prediction error** for each player stat and to produce **next-season projections** for all qualifying players.
+
+We define the problem as a **time-based regression** task:
+\[
+\text{Predict Stat}_{t+1} = f(\text{Stat}_{t}, \text{Stat}_{t-1}, ..., \text{Stat}_{t-k})
+\]
+where \(k\) is the lookback window (1–5 previous seasons).
+
+## Methods Compared
+| Method | Description | Notes |
+|:-------|:-------------|:------|
+| **Equal (EQUAL)** | Simple mean of last k seasons | Baseline |
+| **Exponential (EXP)** | Weighted average giving more importance to recent years | Uses decay parameter α |
+| **Linear (LM)** | Fitted linear regression over k seasons | Sensitive to data availability |
+
+## Evaluation Metric
+The key metric is **relative RMSE (relRMSE)**:
+
+\[
+\text{relRMSE} = \frac{RMSE}{SD(\text{actual})}
+\]
+
+This allows for cross-stat comparisons by normalizing for each stat’s natural variability.
+
+---
+
+# Data Preparation
+
+The preprocessing stage ensures:
+- Minimum **minutes played threshold (1000)** for season inclusion,
+- Correct handling of multi-team years,
+- Rolling **lookback features (L1–L5)** built for each stat,
+- Filtering by season (2015 onward) to ensure modern consistency.
+
+```{r setup}
+# Fast, reproducible, and quiet setup
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  cache = TRUE, cache.comments = FALSE
+)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tidyr)
+  library(stringr)
+  library(purrr)
+  library(broom)
+  library(janitor)
+  library(here)
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+  library(scales)
+  library(rlang)
+  library(ggtext)
+})
+
+knitr::opts_knit$set(root.dir = here::here())
+
+set.seed(1)
+
+if (!exists("params")) {
+params <- list(
+per36_csv = "data/Per36Minutes.csv",
+career_csv = "data/PlayerCareerInfo.csv"
+)
+}
+
+stat_labs <- c(
+pts_per_36_min = "PTS/36",
+trb_per_36_min = "TRB/36",
+ast_per_36_min = "AST/36",
+stl_per_36_min = "STL/36",
+blk_per_36_min = "BLK/36",
+x3p_per_36_min = "3PM/36",
+fg_percent = "FG%",
+ft_percent = "FT%",
+tov_per_36_min = "TOV/36"
+)
+
+```
+
+# Modeling Functions
+
+Here, we define the helper functions used to:
+
+- Filter player eligibility,
+
+- Compute rolling averages,
+
+- Evaluate predictive accuracy across methods.
+
+Each function applies consistent cutoffs and validation rules to maintain fairness between methods.
+
+```{r helpers}
+# Light helpers used in multiple chunks
+wavg <- function(x, w) {
+  s <- sum(w, na.rm = TRUE)
+  ifelse(s > 0, sum(x * w, na.rm = TRUE) / s, NA_real_)
+}
+
+read_data <- function(rel_path) {
+stopifnot(is.character(rel_path), length(rel_path) == 1)
+fp <- here::here(rel_path)
+if (!file.exists(fp)) stop("Missing data file: ", fp, call. = FALSE)
+readr::read_csv(fp, show_col_types = FALSE)
+}
+```
+
+# Load & Robust Season Collapse
+
+This step ingests the raw per-36 dataset and collapses multi-team stints into a single player-season row. It prefers explicit “TOT”/multi-team markers when available and falls back to a games-based heuristic if the team column is missing. Stats across stints are merged with minutes-weighted averages, and FG%/FT% are recomputed from made/attempt totals to avoid mixed denominators.
+
+- Input: Per36Minutes.csv (cleaned to snake_case).
+
+- Combined-row detection: use team/tm when present; else infer by comparing games.
+
+- Minutes & games totals: trust the official combined row if its minutes ≈ sum of team stints (≥95%); otherwise use summed minutes.
+
+- Minutes-weighted merge: PTS/36, TRB/36, AST/36, STL/36, BLK/36, 3PM/36, TOV/36, FGA/36, FTA/36.
+
+- Recomputed percentages: FG% = FGM / FGA, FT% = FTM / FTA from stint-level totals.
+
+- Metadata selection: carry player and pos from the max-minutes stint for that season.
+
+**Output**: by_player_season with one tidy row per (player_id, season) containing g, mp, mpg, per-36 stats, and clean percentages — ready for filtering and lookback feature engineering.
+
+``` {r load and robust season collapse}
+raw <- read_data(params$per36_csv) %>%
+  janitor::clean_names()   # gives snake_case like fg_per_36_min, ft_percent, etc.
+
+tot_tags <- c("tot","2tm","3tm","4tm","5tm","6tm","7tm")
+
+# detect team column if present (some sources use 'team', others 'tm')
+team_col <- dplyr::first(intersect(c("team","tm"), names(raw)))
+if (is.na(team_col)) team_col <- NULL
+
+by_player_season <- raw %>%
+  dplyr::group_by(player_id, season) %>%
+  dplyr::summarise({
+    df <- dplyr::cur_data_all()
+
+    # Combined row detection (prefer team label, fallback to G equality)
+    if (!is.null(team_col)) {
+      is_combined <- tolower(df[[team_col]]) %in% tot_tags
+    } else {
+      g_sum <- sum(df$g, na.rm = TRUE)
+      is_combined <- abs(df$g - (g_sum - df$g)) < 1e-9
+    }
+    team_rows <- !is_combined
+    df_team <- if (any(team_rows, na.rm = TRUE)) df[team_rows, , drop = FALSE] else df
+
+    # Minutes & games totals (prefer combined row if it exists and is consistent)
+    mp_sum <- sum(df_team$mp, na.rm = TRUE)
+    if (any(is_combined, na.rm = TRUE)) {
+      g_val  <- suppressWarnings(max(df$g[is_combined],  na.rm = TRUE))
+      mp_comb <- suppressWarnings(max(df$mp[is_combined], na.rm = TRUE))
+      mp_val <- if (!is.na(mp_comb) && mp_comb >= 0.95 * mp_sum) mp_comb else mp_sum
+    } else {
+      g_val  <- suppressWarnings(max(df$g,  na.rm = TRUE))
+      mp_val <- mp_sum
+    }
+
+    # Recompute % from totals; minutes-weight per-36 across team stints
+    fgm_tot <- sum(df_team$fg_per_36_min  * df_team$mp / 36, na.rm = TRUE)
+    fga_tot <- sum(df_team$fga_per_36_min * df_team$mp / 36, na.rm = TRUE)
+    ftm_tot <- sum(df_team$ft_per_36_min  * df_team$mp / 36, na.rm = TRUE)
+    fta_tot <- sum(df_team$fta_per_36_min * df_team$mp / 36, na.rm = TRUE)
+
+    fg_pct <- ifelse(fga_tot > 0, fgm_tot / fga_tot, NA_real_)
+    ft_pct <- ifelse(fta_tot > 0, ftm_tot / fta_tot, NA_real_)
+
+    pts36 <- wavg(df_team$pts_per_36_min, df_team$mp)
+    trb36 <- wavg(df_team$trb_per_36_min, df_team$mp)
+    ast36 <- wavg(df_team$ast_per_36_min, df_team$mp)
+    stl36 <- wavg(df_team$stl_per_36_min, df_team$mp)
+    blk36 <- wavg(df_team$blk_per_36_min, df_team$mp)
+    x3p36 <- wavg(df_team$x3p_per_36_min, df_team$mp)
+    tov36 <- wavg(df_team$tov_per_36_min, df_team$mp)
+    fga36 <- wavg(df_team$fga_per_36_min, df_team$mp)
+    fta36 <- wavg(df_team$fta_per_36_min, df_team$mp)
+
+    idx_mm <- ifelse(all(is.na(df$mp)), 1L, which.max(df$mp))
+
+    tibble::tibble(
+      player = df$player[idx_mm],
+      pos    = df$pos[idx_mm],
+      g      = g_val,
+      mp     = mp_val,
+      mpg    = ifelse(g_val > 0, mp_val / g_val, NA_real_),
+      fg_percent = fg_pct,
+      ft_percent = ft_pct,
+      pts_per_36_min = pts36,
+      trb_per_36_min = trb36,
+      ast_per_36_min = ast36,
+      stl_per_36_min = stl36,
+      blk_per_36_min = blk36,
+      x3p_per_36_min = x3p36,
+      tov_per_36_min = tov36,
+      fga_per_36_min = fga36,
+      fta_per_36_min = fta36
+    )
+  }, .groups = "drop")
+```
+
+# Filter Modeling Window
+
+This step narrows the dataset to the modern era and to reliably observed player-seasons, producing a clean table for feature engineering and model evaluation.
+
+- Time window: keep seasons 2015 and later to reflect today’s pace/space era and consistent stat definitions.
+
+- Eligibility: require ≥ 1,000 minutes to avoid unstable per-36 noise from small samples.
+
+- Selected fields: retain identifiers (player_id, player, pos, season), usage (mp), efficiency (fg_percent, ft_percent), and the per-36 counting stats used downstream.
+
+- Model scope: define stats_vec, the exact set of nine stats that every method (Equal, EXP, LM) will forecast and evaluate.
+
+**Output**: df_clean, a tidy, filtered table of player-seasons (2015+) meeting the minutes threshold, plus stats_vec, the authoritative list of target statistics for the modeling loop.
+
+
+```{r filter modeling window}
+df_clean <- by_player_season %>%
+  filter(season >= 2015, mp >= 1000) %>%
+  select(
+    player_id, player, pos, season, mp,
+    fg_percent, ft_percent,
+    pts_per_36_min, trb_per_36_min, ast_per_36_min,
+    stl_per_36_min, blk_per_36_min, x3p_per_36_min, tov_per_36_min,
+    fga_per_36_min, fta_per_36_min
+  )
+
+# Stats we’ll model
+stats_vec <- c(
+  "pts_per_36_min","trb_per_36_min","ast_per_36_min",
+  "stl_per_36_min","blk_per_36_min","x3p_per_36_min",
+  "fg_percent","ft_percent","tov_per_36_min"
+)
+```
+
+```{r GLOBALS (needed for evaluation & plotting)}
+# Lookback depth used everywhere
+k_max  <- 5
+k_grid <- 1:k_max
+
+# Minutes rule used by prev_season_ok() and has_full_minutes_k()
+minutes_cutoff <- 1000L
+
+# Train/test split for evaluate_rolling() wrappers
+first_train_end <- 2018L
+
+# Methods’ hyperparameters
+alpha_grid <- c(0.3, 0.4, 0.5, 0.6, 0.7)
+```
+
+# Lookback Features & Method Comparison
+
+This section constructs **lagged features** (L1–Lk) for each stat, defines eligibility helpers, implements three predictor families (Equal / Exponential / Linear), and performs a **walk-forward evaluation** to compute error metrics. Results are aggregated to identify the best method per stat and the winning hyperparameters (k, α).
+
+Inputs & Preconditions
+
+- **Data**: df_clean with identifiers (player_id, season), mp, and all targets in stats_vec.
+
+- **Globals**: k_max, k_grid = 1:k_max, minutes_cutoff, alpha_grid, first_train_end.
+
+- **Sanity check**: stopifnot(...) confirms required columns exist before proceeding.
+
+## Build Lagged Feature Matrix
+
+- Start from a minimal base frame: player_id, season, mp, and all stats_vec columns.
+
+- For each i ∈ {1,…,k_max}:
+
+- Shift season forward by i to align past values with the future target season.
+
+- Rename mp → mp_Li and each stat s → s_Li.
+
+- Keep only player_id, shifted season, mp_Li, and {stat}_Li.
+
+- Join all lag tables back into joined so each (player, season) contains its aligned L1…Lk history.
+
+- Guardrail: assert mp_L1…mp_Lk exist.
+
+## Eligibility Helpers
+
+- has_full_minutes_k(df, k): all mp_L1…mp_Lk ≥ minutes_cutoff.
+
+- has_full_stats_k(df, stat, k): all {stat}_L1…{stat}_Lk are non-NA.
+
+- prev_season_ok(df): specifically enforces L1 minutes ≥ cutoff.
+
+These gates ensure fair comparisons across methods and prevent “ghost” eligibility.
+
+## Predictors (per stat, per k)
+
+- Equal (predict_equal_k): arithmetic mean of {stat}_L1…{stat}_Lk.
+
+- Exponential (predict_exp_k): geometric decay weights w ∝ α(1−α)^{0:(k−1)} applied to {stat}_L1…{stat}_Lk.
+
+- Linear (fit_and_predict_reg_k): OLS fit on {stat}_L1…{stat}_Lk over a train slice (≤ train_end_season) and predict the next season.
+
+All three strictly apply the eligibility helpers before computing predictions.
+
+## Walk-Forward Evaluation
+
+- evaluate_rolling(...) iterates over train end seasons (first_train_end … last-1), and for each:
+
+- Builds predictions for the next season with the selected method (Equal / EXP / LM).
+
+- Collects out-of-sample rows (actual vs. predicted) and tags the train_end.
+
+The result is a tidy stack of test-season predictions across the rolling horizon.
+
+## Metrics (scale-free)
+
+- compute_metrics(df, pred_col) returns:
+
+- RMSE, MAE, bias, SSE/SST, R², and SD(actual).
+
+- relRMSE = RMSE / SD(actual), relMAE = MAE / SD(actual).
+
+If SD(actual) is zero/invalid, relative metrics return NA by design.
+
+## Evaluate all (k, α, method) combos
+
+Wrappers:
+
+- evaluate_equal(stat, k)
+
+- evaluate_exp(stat, k, alpha)
+
+- evaluate_lm(stat, k)
+
+Each calls evaluate_rolling, then compute_metrics, and appends method, stat, k, alpha labels.
+
+compare_methods_for_stat(stat) maps:
+
+- over k_grid for Equal and LM,
+
+- over k_grid × alpha_grid for EXP,
+then binds, orders by rel_rmse, and ranks.
+
+## Aggregate: all_results and winners
+
+- all_results: rows of (stat, method, k, α) with their evaluation metrics across the full walk-forward period.
+
+- winners: one row per stat with the best rel_rmse method and its hyperparameters, plus the margin to next best for interpretability.
+
+**Output**: a complete evaluation table (all_results) and a concise leaderboard (winners) used downstream for visualization and for choosing the projection method per stat.
+
+```{r lookback features and method comparison}
+stopifnot(all(c("player_id","season","mp", stats_vec) %in% names(df_clean)))
+
+base <- df_clean %>% dplyr::select(player_id, season, mp, dplyr::all_of(stats_vec))
+
+lagged_list <- lapply(1:k_max, function(i) {
+  base %>%
+    dplyr::mutate(season = season + i) %>%
+    # mp -> mp_L{i}
+    dplyr::rename(!!paste0("mp_L", i) := mp) %>%
+    # stats -> {stat}_L{i}
+    dplyr::rename_with(~ paste0(.x, "_L", i), dplyr::all_of(stats_vec)) %>%
+    # keep only player_id, season, mp_L{i}, and the lagged stats
+    dplyr::select(
+      player_id, season,
+      !!rlang::sym(paste0("mp_L", i)),
+      dplyr::all_of(paste0(stats_vec, "_L", i))
+    )
+})
+
+# Start from the actual (unlagged) columns
+joined <- base %>% dplyr::select(player_id, season, mp, dplyr::all_of(stats_vec))
+
+# Left-join each lag table
+for (lag_tbl in lagged_list) {
+  joined <- dplyr::left_join(joined, lag_tbl, by = c("player_id","season"))
+}
+
+# Quick sanity check: ensure mp_L1..mp_L5 exist
+stopifnot(all(paste0("mp_L", 1:k_max) %in% names(joined)))
+
+# --- 2) Helpers: minutes eligibility + stat availability for a given k ---
+has_full_minutes_k <- function(df, k) {
+  req <- paste0("mp_L", 1:k)
+  df %>%
+    dplyr::mutate(.ok_min = dplyr::if_all(dplyr::all_of(req), ~ !is.na(.x) & .x >= minutes_cutoff)) %>%
+    dplyr::pull(.ok_min)
+}
+
+has_full_stats_k <- function(df, stat, k) {
+  req <- paste0(stat, "_L", 1:k)
+  df %>%
+    dplyr::mutate(.ok_stat = dplyr::if_all(dplyr::all_of(req), ~ !is.na(.x))) %>%
+    dplyr::pull(.ok_stat)
+}
+
+# Your “skip if previous season < 1000” rule (independent of k)
+prev_season_ok <- function(df) {
+  if (!("mp_L1" %in% names(df))) return(rep(FALSE, nrow(df)))
+  !is.na(df$mp_L1) & df$mp_L1 >= minutes_cutoff
+}
+
+# --- 3) Predictors (equal / exponential / linear regression) ---
+predict_equal_k <- function(df, stat, k) {
+  lag_cols <- paste0(stat, "_L", 1:k)
+  df %>%
+    dplyr::filter(prev_season_ok(.),
+                  has_full_minutes_k(., k),
+                  has_full_stats_k(., stat, k)) %>%
+    dplyr::mutate(pred_equal = rowMeans(dplyr::across(dplyr::all_of(lag_cols)))) %>%
+    dplyr::select(player_id, season, actual = !!rlang::sym(stat), pred_equal)
+}
+
+predict_exp_k <- function(df, stat, k, alpha = 0.5) {
+  lag_cols <- paste0(stat, "_L", 1:k)
+  w <- alpha * (1 - alpha)^(0:(k-1)); w <- w / sum(w)
+  df %>%
+    dplyr::filter(prev_season_ok(.),
+                  has_full_minutes_k(., k),
+                  has_full_stats_k(., stat, k)) %>%
+    dplyr::mutate(
+      pred_exp = as.numeric(as.matrix(dplyr::select(., dplyr::all_of(lag_cols))) %*% w)
+    ) %>%
+    dplyr::select(player_id, season, actual = !!rlang::sym(stat), pred_exp)
+}
+
+fit_and_predict_reg_k <- function(df, stat, k, train_end_season) {
+  lag_cols <- paste0(stat, "_L", 1:k)
+  d <- df %>%
+    dplyr::filter(prev_season_ok(.),
+                  has_full_minutes_k(., k),
+                  has_full_stats_k(., stat, k)) %>%
+    dplyr::select(player_id, season, dplyr::all_of(stat), dplyr::all_of(lag_cols)) %>%
+    tidyr::drop_na()
+  train <- d %>% dplyr::filter(season <= train_end_season)
+  test  <- d %>% dplyr::filter(season == train_end_season + 1)
+
+  empty_out <- tibble::tibble(
+    player_id = character(), season = numeric(),
+    actual = numeric(), pred_lm = numeric()
+  )
+  if (nrow(train) == 0 || nrow(test) == 0) return(empty_out)
+
+  form <- stats::as.formula(paste(stat, "~", paste(lag_cols, collapse = " + ")))
+  fit  <- stats::lm(form, data = train)
+  test %>%
+    dplyr::mutate(pred_lm = stats::predict(fit, newdata = test)) %>%
+    dplyr::select(player_id, season, actual = !!rlang::sym(stat), pred_lm)
+}
+
+# --- 4) Rolling (walk-forward) evaluation ---
+evaluate_rolling <- function(df_joined, stat, k, method = c("equal","exp","lm"),
+                             alpha = 0.5, first_train_end = 2018,
+                             last_test_season = max(df_joined$season, na.rm = TRUE)) {
+  method <- match.arg(method)
+  seasons <- sort(unique(df_joined$season))
+  stops <- seasons[seasons >= first_train_end & seasons < last_test_season]
+
+  out <- vector("list", length(stops))
+  j <- 0L
+  for (te in stops) {
+    preds <- switch(
+      method,
+      equal = predict_equal_k(df_joined %>% dplyr::filter(season <= te + 1), stat, k),
+      exp   = predict_exp_k  (df_joined %>% dplyr::filter(season <= te + 1), stat, k, alpha),
+      lm    = fit_and_predict_reg_k(df_joined, stat, k, train_end_season = te)
+    )
+    if (nrow(preds) == 0) next
+    preds <- preds %>% dplyr::filter(season == te + 1)
+    if (nrow(preds)) { j <- j + 1L; out[[j]] <- preds %>% dplyr::mutate(train_end = te) }
+  }
+  if (j == 0L) return(tibble::tibble())
+  dplyr::bind_rows(out[1:j])
+}
+
+# --- 5) Metrics (adds scale-free rel_rmse / rel_mae) ---
+compute_metrics <- function(df, pred_col = "pred") {
+  if (nrow(df) == 0) {
+    return(tibble::tibble(
+      n = 0, rmse = NA_real_, mae = NA_real_, bias = NA_real_,
+      sse = NA_real_, sst = NA_real_, r2 = NA_real_,
+      sd_actual = NA_real_, rel_rmse = NA_real_, rel_mae = NA_real_
+    ))
+  }
+  err  <- df[[pred_col]] - df$actual
+  rmse <- sqrt(mean(err^2, na.rm = TRUE))
+  mae  <- mean(abs(err), na.rm = TRUE)
+  bias <- mean(err,       na.rm = TRUE)
+  sse  <- sum((df$actual - df[[pred_col]])^2, na.rm = TRUE)
+  sst  <- sum((df$actual - mean(df$actual, na.rm = TRUE))^2, na.rm = TRUE)
+  r2   <- if (!is.finite(sst) || sst <= 0) NA_real_ else (1 - sse/sst)
+  sd_actual <- stats::sd(df$actual, na.rm = TRUE)
+  rel_rmse  <- if (!is.finite(sd_actual) || sd_actual == 0) NA_real_ else rmse / sd_actual
+  rel_mae   <- if (!is.finite(sd_actual) || sd_actual == 0) NA_real_ else mae  / sd_actual
+  tibble::tibble(n = nrow(df), rmse, mae, bias, sse, sst, r2, sd_actual, rel_rmse, rel_mae)
+}
+
+# --- 6) Wrappers to evaluate all k/alpha/method combos for a stat ---
+evaluate_equal <- function(stat, k) {
+  res <- evaluate_rolling(joined, stat, k, method = "equal", first_train_end = first_train_end)
+  if (nrow(res) == 0) return(NULL)
+  compute_metrics(dplyr::rename(res, pred = pred_equal)) %>%
+    dplyr::mutate(method = "equal", stat = stat, k = k, alpha = NA_real_)
+}
+
+evaluate_exp <- function(stat, k, alpha) {
+  res <- evaluate_rolling(joined, stat, k, method = "exp", alpha = alpha, first_train_end = first_train_end)
+  if (nrow(res) == 0) return(NULL)
+  compute_metrics(dplyr::rename(res, pred = pred_exp)) %>%
+    dplyr::mutate(method = "exp", stat = stat, k = k, alpha = alpha)
+}
+
+evaluate_lm <- function(stat, k) {
+  res <- evaluate_rolling(joined, stat, k, method = "lm", first_train_end = first_train_end)
+  if (nrow(res) == 0) return(NULL)
+  compute_metrics(dplyr::rename(res, pred = pred_lm)) %>%
+    dplyr::mutate(method = "lm", stat = stat, k = k, alpha = NA_real_)
+}
+
+compare_methods_for_stat <- function(stat) {
+  eq <- purrr::map_dfr(k_grid, ~ evaluate_equal(stat, .x))
+  ex <- purrr::map_dfr(k_grid, ~ purrr::map_dfr(alpha_grid, function(a) evaluate_exp(stat, .x, a)))
+  lm <- purrr::map_dfr(k_grid, ~ evaluate_lm(stat, .x))
+  dplyr::bind_rows(eq, ex, lm) %>%
+    dplyr::arrange(rel_rmse) %>%
+    dplyr::mutate(rank = dplyr::row_number())
+}
+
+# --- 7) Recompute all_results and winners ---
+all_results <- purrr::map_dfr(stats_vec, compare_methods_for_stat)
+
+winners <- all_results %>%
+  dplyr::group_by(stat) %>%
+  dplyr::arrange(rel_rmse, .by_group = TRUE) %>%
+  dplyr::mutate(rel_rmse_next_best = dplyr::lead(rel_rmse)) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup() %>%
+  dplyr::transmute(
+    stat,
+    best_method = method,
+    best_k      = k,
+    best_alpha  = alpha,
+    rmse, mae, r2, rel_rmse, rel_mae,
+    margin_vs_next = rel_rmse_next_best - rel_rmse
+  )
+
+```
+
+# Predict 2026 Per-36 with Experience Adjustment & Graceful Fallback
+
+This section generates next-season (target year) per-36 projections for every player by:
+
+- learning experience-binned year-over-year (YoY) deltas from history,
+
+- building target-season feature rows with up to L1…L5 lags,
+
+- applying each stat’s winning method/hyperparameters from winners, with automatic fallback to shorter k when needed, and
+
+- adjusting the raw predictions by the experience-bin delta and clipping percentage stats to 0,1.
+
+**Inputs**
+
+- Historical clean data: df_clean (2015+, ≥1,000 minutes) and stats_vec (the 9 modeled stats).
+
+- Career metadata: params$career_csv providing each player’s first season (from) to compute experience.
+
+- Winners table: winners (best method, k, α per stat) from the evaluation phase.
+
+- Target season: params$target_season (e.g., 2026).
+
+## Compute Experience & Year-over-Year (YoY) Deltas
+
+- Build exp_year_t = season − from + 1 for each player-season.
+
+- Create a lag(+1) version of the wide stat table, then compute YoY deltas:
+
+Δ𝑡(stat)=stat𝑡−stat𝑡−1
+
+- Keep deltas only where both seasons exist and the player has a valid experience year (≥2).
+
+## Bin Experience and Learn Mean Deltas
+
+- Define experience bins: 2–3, 4–6, 7–10, 11–15, 16+.
+
+- For each stat × exp_bin, compute mean YoY delta and counts.
+
+- Produce a compact delta_lookup(stat, exp_bin → mean_delta) used to adjust predictions.
+
+## Build Target-Season Features (L1…L5)
+
+- **make_features_for_target(...)** creates a one-row-per-player feature frame for the target year, joining up to 5 lag columns for every stat.
+
+- This frame is the common input for all three predictor families at future time𝑇
+
+## Predict Using Winners, with Graceful k Fallback
+
+- For each stat’s best_method, best_k, and alpha (from winners), attempt prediction at k = k_top.
+
+- If any required lags are missing, automatically fall back to k = k_top−1, …, 1 until prediction is possible.
+
+-Predictors:
+
+  - Equal: mean of {stat}_L1…{stat}_Lk.
+
+  - Exponential: weighted sum with 𝑤∝𝛼(1−𝛼)0:(𝑘−1)
+
+  - Linear (LM): fit on historical lagged matrix up to 𝑇−1, predict on features at 𝑇.
+
+- Consolidate to one prediction per player–stat using the largest feasible k.
+
+## Ensure Coverage of All 9 Stats (Last-Observation Fallback)
+
+- Build a full player × stat grid for the target year.
+
+- If any stat is still missing a prediction after Step D, fill it with the latest available lag value (L1…L5), recording which lag was used.
+
+- This guarantees nine predictions per player.
+
+## Apply Experience Adjustment & Clip Percentages
+
+- Compute each player’s target-season experience year and bin.
+
+- Join delta_lookup and add the mean bin delta to the raw prediction:
+
+stat^adj=stat^base+mean_delta(stat,exp_bin)
+
+- For percentage stats (fg_percent, ft_percent), clip to [0,1] after adjustment.
+
+- Attach player, pos, and tidy columns for inspection.
+
+## **Outputs**
+
+- preds_2026_final (long): one row per player × stat with base prediction, experience delta, adjusted prediction, method/k/α used, and experience metadata.
+
+- preds_2026_wide (wide): one row per player with the nine adjusted per-36 predictions as columns.
+
+- A sample preview prints the first 15 players alphabetically for quick validation.
+
+## TLDR
+
+the procedure blends best historical method performance with experience-aware adjustments, while robustly handling missing lags—so every qualified player receives a realistic, constraint-aware projection for the target season.
+
+```{r predict 2026 per-36 with graceful fallback and year over year deltas}
+# Experience year from career "from"
+career <- read_data(params$career_csv) %>%
+janitor::clean_names() %>%
+dplyr::select(player_id, from) %>%
+dplyr::mutate(from = as.integer(from))
+
+# Experience-binned YoY deltas
+df_exp <- df_clean %>%
+  select(player_id, season, mp, all_of(stats_vec)) %>%
+  left_join(career, by = "player_id") %>%
+  mutate(exp_year_t = ifelse(!is.na(from), season - from + 1L, NA_integer_))
+
+lag_tbl <- df_exp %>%
+  select(player_id, season, all_of(stats_vec)) %>%
+  mutate(season = season + 1L) %>%
+  rename_with(~ paste0(.x, "_lag1"), all_of(stats_vec))
+
+yoy <- df_exp %>%
+  inner_join(lag_tbl, by = c("player_id","season")) %>%
+  mutate(across(all_of(stats_vec),
+                ~ .x - get(paste0(cur_column(), "_lag1")),
+                .names = "{.col}_delta"))
+
+yoy_long <- yoy %>%
+  select(player_id, season, exp_year_t, ends_with("_delta")) %>%
+  pivot_longer(cols = ends_with("_delta"), names_to = "stat", values_to = "delta") %>%
+  mutate(stat = str_remove(stat, "_delta$"), exp_year = exp_year_t) %>%
+  filter(!is.na(delta), !is.na(exp_year), exp_year >= 2)
+
+exp_breaks <- c(2, 4, 7, 11, 16, Inf)
+exp_labels <- c("2–3", "4–6", "7–10", "11–15", "16+")
+bin_exp <- function(exp_year) cut(exp_year, breaks = exp_breaks, labels = exp_labels, right = FALSE)
+
+yoy_binned <- yoy_long %>%
+  mutate(exp_bin = bin_exp(exp_year)) %>%
+  group_by(stat, exp_bin) %>%
+  summarise(n_pairs = n(), mean_delta = mean(delta, na.rm = TRUE), .groups = "drop")
+
+delta_lookup <- yoy_binned %>% select(stat, exp_bin, mean_delta)
+
+# Build features for T_target
+make_features_for_target <- function(df_base, T, k_max = 5, stats = stats_vec) {
+  feat <- df_base %>% filter(season == T - 1) %>% distinct(player_id) %>% mutate(season = T)
+  for (i in 1:k_max) {
+    lag_i <- df_base %>% filter(season == T - i) %>% select(player_id, all_of(stats))
+    names(lag_i)[-1] <- paste0(names(lag_i)[-1], "_L", i)
+    feat <- feat %>% left_join(lag_i, by = "player_id")
+  }
+  feat
+}
+
+predict_equal_k_on_features <- function(feat, stat, k) {
+  lag_cols <- paste0(stat, "_L", 1:k)
+  feat %>%
+    filter(if_all(all_of(lag_cols), ~ !is.na(.))) %>%
+    mutate(pred = rowMeans(across(all_of(lag_cols)), na.rm = FALSE)) %>%
+    transmute(player_id, season, stat = stat, pred, method = "equal", k_used = k, alpha = NA_real_)
+}
+
+predict_exp_k_on_features <- function(feat, stat, k, alpha = 0.7) {
+  lag_cols <- paste0(stat, "_L", 1:k)
+  w <- alpha * (1 - alpha)^(0:(k-1)); w <- w / sum(w)
+  feat %>%
+    filter(if_all(all_of(lag_cols), ~ !is.na(.))) %>%
+    mutate(pred = as.numeric(as.matrix(select(., all_of(lag_cols))) %*% w)) %>%
+    transmute(player_id, season, stat = stat, pred, method = "exp", k_used = k, alpha = alpha)
+}
+
+fit_predict_lm_k_for_future <- function(df_hist, featT, stat, k, T) {
+  base_hist <- df_hist %>% select(player_id, season, all_of(stats_vec))
+  lagged_list <- lapply(1:5, function(i) {
+    base_hist %>% rename_with(~ paste0(.x, "_L", i), all_of(stats_vec)) %>%
+      mutate(season = season + i)
+  })
+  joined_hist <- Reduce(function(x, y) left_join(x, y, by = c("player_id","season")), lagged_list, init = base_hist)
+  lag_cols <- paste0(stat, "_L", 1:k)
+  train <- joined_hist %>%
+    select(player_id, season, all_of(stat), all_of(lag_cols)) %>%
+    filter(season <= T - 1) %>% tidyr::drop_na()
+  if (nrow(train) == 0) return(tibble(player_id=character(),season=integer(),stat=character(),
+                                      pred=double(),method=character(),k_used=integer(),alpha=double()))
+  form <- as.formula(paste(stat, "~", paste(lag_cols, collapse = " + ")))
+  fit  <- lm(form, data = train)
+  featT %>%
+    filter(if_all(all_of(lag_cols), ~ !is.na(.))) %>%
+    mutate(pred = predict(fit, newdata = .)) %>%
+    transmute(player_id, season, stat = stat, pred, method = "lm", k_used = k, alpha = NA_real_)
+}
+
+# Choose best method per stat (from winners) and predict for 2026 with k fallback
+featT <- make_features_for_target(
+  df_clean %>% select(player_id, season, all_of(stats_vec)),
+  T = params$target_season, k_max = 5, stats = stats_vec
+)
+
+# You should already have `winners` from Step 3; if not, stop here.
+stopifnot(exists("winners"))
+
+preds_2026_base <- purrr::map_dfr(seq_len(nrow(winners)), function(i) {
+  row <- winners[i, ]
+  stat <- row$stat
+  meth <- row$best_method
+  k_top <- as.integer(row$best_k)
+  alpha <- row$best_alpha
+  ks <- k_top:1
+  bind_rows(lapply(ks, function(kk) {
+    if (meth == "equal") {
+      predict_equal_k_on_features(featT, stat, kk)
+    } else if (meth == "exp") {
+      predict_exp_k_on_features(featT, stat, kk, ifelse(is.na(alpha), 0.7, alpha))
+    } else {
+      fit_predict_lm_k_for_future(df_clean, featT, stat, kk, params$target_season)
+    }
+  })) %>%
+    arrange(player_id, dplyr::desc(k_used)) %>%
+    group_by(player_id) %>%
+    slice_head(n = 1) %>%
+    ungroup()
+})
+
+# Ensure 9 stats per player with L1..L5 fallback
+features_2026 <- featT
+eligible_ids <- features_2026 %>% distinct(player_id)
+grid_all <- eligible_ids %>% tidyr::crossing(stat = stats_vec) %>% mutate(season = params$target_season)
+preds_joined <- grid_all %>% left_join(preds_2026_base, by = c("player_id","season","stat"))
+
+if (any(is.na(preds_joined$pred))) {
+  cand <- preds_joined %>% filter(is.na(pred)) %>% left_join(features_2026, by = c("player_id","season"))
+  latest_non_na <- function(df, cols) { out <- rep(NA_real_, nrow(df)); for (i in seq_along(cols)) { v <- df[[cols[i]]]; idx <- is.na(out) & !is.na(v); out[idx] <- v[idx]; if (all(!is.na(out))) break }; out }
+  which_lag_used <- function(df, cols) { out <- rep(NA_integer_, nrow(df)); for (i in seq_along(cols)) { v <- df[[cols[i]]]; idx <- is.na(out) & !is.na(v); out[idx] <- i; if (all(!is.na(out))) break }; out }
+  fb_list <- lapply(stats_vec, function(s) {
+    sub <- cand %>% filter(stat == s); if (nrow(sub) == 0) return(NULL)
+    lag_cols <- paste0(s, "_L", 1:5); lag_cols <- lag_cols[lag_cols %in% names(sub)]
+    tibble(player_id = sub$player_id, season = sub$season, stat = s,
+           pred = latest_non_na(sub, lag_cols), method = "equal", k_used = which_lag_used(sub, lag_cols), alpha = NA_real_) %>%
+      filter(!is.na(pred))
+  })
+  fb_any <- bind_rows(fb_list)
+  preds_2026_base <- preds_joined %>%
+    select(player_id, season, stat, pred, method, k_used, alpha) %>%
+    bind_rows(fb_any) %>%
+    arrange(player_id, stat, dplyr::desc(k_used)) %>%
+    group_by(player_id, season, stat) %>%
+    slice_head(n = 1) %>%
+    ungroup()
+}
+
+# Add YoY bin delta; clip percentages; attach labels
+is_pct_stat <- function(s) s %in% c("fg_percent","ft_percent")
+
+exp_2026 <- eligible_ids %>%
+  mutate(season = params$target_season) %>%
+  left_join(career %>% select(player_id, from), by = "player_id") %>%
+  mutate(exp_year_2026 = ifelse(!is.na(from), season - from + 1L, NA_integer_),
+         exp_bin = bin_exp(exp_year_2026))
+
+preds_2026_final <- preds_2026_base %>%
+  left_join(exp_2026 %>% select(player_id, season, exp_year_2026, exp_bin), by = c("player_id","season")) %>%
+  left_join(delta_lookup, by = c("stat","exp_bin")) %>%
+  mutate(delta_exp = ifelse(is.na(mean_delta), 0, mean_delta),
+         pred_adj_raw = pred + delta_exp,
+         pred_adj = ifelse(is_pct_stat(stat), pmax(0, pmin(1, pred_adj_raw)), pred_adj_raw)) %>%
+  left_join(df_clean %>% filter(season == params$target_season - 1) %>% select(player_id, player, pos), by = "player_id") %>%
+  select(player_id, player, pos, season, stat, pred_base = pred, delta_exp, pred_adj, method, k_used, alpha, exp_year_2026, exp_bin) %>%
+  group_by(player_id, season, stat) %>% summarise(across(everything(), ~ dplyr::first(.x)), .groups = "drop")
+
+preds_2026_wide <- preds_2026_final %>%
+  select(player_id, player, pos, season, stat, pred_adj) %>%
+  tidyr::pivot_wider(names_from = stat, values_from = pred_adj)
+
+# Show a sample
+preds_2026_final %>% arrange(player) %>% dplyr::slice_head(n = 15)
+```
+
+# Best relRMSE by Method
+
+This section summarizes model performance per statistic by extracting the best relative RMSE achieved by each method (Equal, Exponential, Linear) and rendering a bar chart where longer bars mean smaller error. Each figure is shown inline and also saved to /output.
+
+**Inputs**
+
+- all_results: evaluation table containing stat, method, k, rel_rmse (and other metrics).
+
+- stats_vec: the list of nine target statistics.
+
+- Optional stat_labs: pretty display names for stats (used by lab_for_stat()).
+
+**Reducer (best-per-method table)**
+
+- get_df_best(target_stat) filters all_results to that stat, keeps finite rel_rmse, and computes:
+
+  - best_rel_rmse per method (minimum relRMSE),
+
+  - best_k corresponding to that minimum.
+
+- Ensures the x-axis always shows equal / exp / lm by left-joining a fixed method list (so categories render even if a method is missing).
+
+**Plot design (longer = better)**
+
+- Computes a local baseline band (y_bottom from the worst best-RMSE; y_top from the best best-RMSE) and converts each method’s RMSE to a bar length:
+bar_len = y_bottom − best_rel_rmse.
+
+- The chart:
+
+  - Bars grow upward from zero, so longer bars mean smaller error.
+
+  - Text labels show the winning lookback (e.g., L4) and best relRMSE (percentage).
+
+  - Minimal theme; x-grid removed for clarity.
+
+**Saving & display**
+
+- plot_best_rel_rmse_by_method(stat, save, out_dir, width, height, dpi):
+
+  - Returns a ggplot object for inline display.
+
+  - When save = TRUE, writes relRMSE_<stat>.png to /output.
+
+- The trailing loop iterates over stats_vec, prints each plot (so it appears in the knitted HTML) and saves a PNG.
+
+## TLDR
+
+This visualization offers a compact, stat-by-stat comparison of projection methods. By normalizing error (relRMSE) and emphasizing shorter error = longer bar, it’s easy to see where EXP or LM outperform EQUAL, and which lookback depth delivered that win.
+
+```{r Best relRMSE by method (one figure per stat), message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(stringr)
+library(tidyr)
+library(purrr)
+
+# Helper: pretty label for a stat key
+lab_for_stat <- function(stat_key) {
+  if (exists("stat_labs") && is.list(stat_labs) && stat_key %in% names(stat_labs)) {
+    stat_labs[[stat_key]]
+  } else stat_key
+}
+
+# --- Reducer: best per method for a given stat, from all_results ---
+get_df_best <- function(target_stat) {
+  stopifnot(all(c("stat","k","method","rel_rmse") %in% names(all_results)))
+  all_results %>%
+    filter(stat == target_stat, is.finite(rel_rmse)) %>%
+    group_by(method) %>%
+    summarise(
+      best_rel_rmse = min(rel_rmse, na.rm = TRUE),
+      best_k        = k[which.min(rel_rmse)][1],
+      .groups = "drop"
+    ) %>%
+    mutate(method = factor(method, levels = c("equal","exp","lm")))
+}
+
+# --- Plot function: bars longer when RMSE is smaller (bars grow from bottom) ---
+plot_best_rel_rmse_by_method <- function(target_stat, save = FALSE, out_dir = "output",
+                                         width = 6, height = 4, dpi = 150) {
+  df_best <- get_df_best(target_stat)
+
+  # Fill any missing methods with NA so the x-axis keeps all three categories
+  all_methods <- tibble(method = factor(c("equal","exp","lm"), levels = c("equal","exp","lm")))
+  df_best <- all_methods %>% left_join(df_best, by = "method")
+
+  # Compute a common band and a "bar length" so smaller RMSE -> longer bar
+  worst    <- suppressWarnings(max(df_best$best_rel_rmse, na.rm = TRUE))
+  best     <- suppressWarnings(min(df_best$best_rel_rmse, na.rm = TRUE))
+  # guard for all-NA scenario
+  if (!is.finite(worst)) worst <- 1
+  if (!is.finite(best))  best  <- 0.2
+
+  y_bottom <- ceiling(worst * 10) / 10      # round *up* to next 0.1
+  y_top    <- floor(best  * 10) / 10        # round *down* to prev 0.1
+  if (!is.finite(y_top) || y_top >= y_bottom) y_top <- max(best - 0.02, 0)
+
+  # Bar length = how much better than the "worst band bottom" the method is
+  df_best <- df_best %>%
+    mutate(
+      lab_k    = ifelse(is.na(best_k), "", paste0("L", best_k)),
+      lab_rmse = ifelse(is.na(best_rel_rmse), "", percent(best_rel_rmse, accuracy = 1)),
+      bar_len  = pmax(y_bottom - best_rel_rmse, 0)  # longer = smaller RMSE
+    )
+
+  title_txt <- paste0(lab_for_stat(target_stat), " — Best Relative RMSE by Method")
+
+  p <- ggplot(df_best, aes(x = method, y = bar_len, fill = method)) +
+    geom_col(width = 0.7, show.legend = FALSE, na.rm = TRUE) +
+    # put the actual RMSE text slightly above the bar
+    geom_text(aes(label = ifelse(lab_k == "", lab_rmse, paste0(lab_k, " • ", lab_rmse))),
+              vjust = -0.35, size = 4, fontface = "bold", na.rm = TRUE) +
+    # Y shows "longer is better"; annotate the scale meaning
+    scale_y_continuous(
+      limits = c(0, max(df_best$bar_len, na.rm = TRUE) * 1.15),
+      expand = expansion(mult = c(0, 0.05)),
+      breaks = pretty
+    ) +
+    labs(
+      title = title_txt,
+      subtitle = "Longer bar = smaller (better) relative RMSE. Labels show winning lookback and relRMSE.",
+      x = NULL,
+      y = "Bar length ∝ (baseline − best relRMSE)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.major.x = element_blank(),
+      plot.title.position = "plot"
+    )
+
+  if (isTRUE(save)) {
+    if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+    file_safe <- str_replace_all(target_stat, "[^A-Za-z0-9_]+", "_")
+    out_path <- file.path(out_dir, paste0("relRMSE_", file_safe, ".png"))
+    ggsave(out_path, p, width = width, height = height, dpi = dpi)
+    message("Saved: ", out_path)
+  }
+
+  p
+}
+
+# --- Display one example interactively in the knitted HTML ---
+# plot_best_rel_rmse_by_method("pts_per_36_min", save = FALSE)
+
+# --- Display & save one figure per stat ---
+# (Each plot will appear in the HTML and also be written to /output)
+invisible(lapply(stats_vec, function(s) {
+  p <- plot_best_rel_rmse_by_method(s, save = TRUE, out_dir = "output")
+  print(p)  # ensures the plot is displayed in the knitted HTML
+}))
+```
+
+# Predictability Summary Visualization
+
+This final visualization ranks all nine modeled statistics by predictability, measured through each stat’s best relative RMSE (lower is better).
+Each bar represents the optimal combination of method and lookback window that achieved the lowest error during the historical evaluation.
+
+**Purpose**
+
+- To summarize which player statistics are most consistently predictable from past performance.
+
+- To illustrate the gap in year-to-year stability between different skill types (e.g., volume stats like rebounds vs. efficiency stats like free-throw %).
+
+- To highlight the methods that proved most effective for each metric (color-coded by weighting method).
+
+**Interpretation**
+
+- Longer bars indicate higher predictability (smaller relative RMSE).
+
+- Labels on each bar specify the winning method, lookback length, and achieved relative RMSE.
+
+- All counting statistics are normalized per 36 minutes, ensuring fair comparisons across players and seasons.
+
+## TLDR
+In short, this figure makes it easy to see which on-court metrics tend to persist most reliably year-to-year under optimal modeling conditions.
+
+```{r Most predictable stats + show winning method & k}
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+stopifnot(
+exists("all_results"),
+all(c("stat","method","k","rel_rmse") %in% names(all_results)),
+exists("stats_vec")
+)
+
+# 1) Winner (lowest relRMSE) per stat across all methods/lookbacks
+
+winners_per_stat <- all_results %>%
+filter(is.finite(rel_rmse), stat %in% stats_vec) %>%
+group_by(stat) %>%
+slice_min(rel_rmse, n = 1, with_ties = FALSE) %>%
+ungroup()
+
+# 2) Short display labels
+
+short_lab <- c(
+"pts_per_36_min" = "PTS",
+"trb_per_36_min" = "REB",
+"ast_per_36_min" = "AST",
+"stl_per_36_min" = "STL",
+"x3p_per_36_min" = "3PM",
+"tov_per_36_min" = "TOV",
+"blk_per_36_min" = "BLK",
+"fg_percent"     = "FG%",
+"ft_percent"     = "FT%"
+)
+
+plot_df <- winners_per_stat %>%
+mutate(
+stat_label = short_lab[stat],
+stat_label = factor(stat_label)  # we'll order next
+) %>%
+arrange(rel_rmse) %>%
+mutate(stat_label = factor(stat_label, levels = rev(unique(stat_label))))
+
+# 3) Convert to "longer = better" bar lengths via a baseline
+
+baseline <- max(plot_df$rel_rmse, na.rm = TRUE)
+plot_df <- plot_df %>% mutate(bar_len = pmax(baseline - rel_rmse, 0))
+
+# Helper: bottom-axis breaks (on bar_len scale), labeled as relRMSE
+
+mk_breaks <- function(x) pretty(x, n = 5)
+
+p_all9_clean <- ggplot(plot_df, aes(x = stat_label, y = bar_len, fill = method)) +
+geom_col(width = 0.75, show.legend = TRUE) +
+geom_text(
+aes(label = paste0(toupper(method), " • L", k, " • ", percent(rel_rmse, accuracy = 0.1))),
+hjust = -0.05, size = 3.8, fontface = "bold"
+) +
+coord_flip() +
+scale_y_continuous(
+limits = c(0, max(plot_df$bar_len, na.rm = TRUE) * 1.12),
+breaks = mk_breaks,
+labels = function(b) percent(baseline - b, accuracy = 0.1),  # show actual relRMSE at bottom
+expand = expansion(mult = c(0, 0.12)),
+name = "Best relRMSE (lower is better)"
+) +
+labs(
+title = "Predictability Across All 9 Stats (Longer Bar = Lower relRMSE)",
+subtitle = "Each bar uses the winning METHOD • Lookback for that stat. All counting stats are per 36 minutes.",
+x = NULL,
+fill = "Method"
+) +
+theme_minimal(base_size = 12) +
+theme(
+panel.grid.major.y = element_blank(),
+plot.title.position = "plot"
+)
+
+print(p_all9_clean)
+
+# Optional: save to /output
+
+if (!dir.exists("output")) dir.create("output", recursive = TRUE)
+ggsave(file.path("output", "all9_predictability_clean.png"),
+p_all9_clean, width = 8.5, height = 5.25, dpi = 150)
+
+```
+
+# Findings
+
+- Predictability varies widely by stat. Rebounds, assists, and points per 36 minutes are the most stable and predictable metrics, while free throw % and field goal % show the highest volatility year-to-year.
+
+- Volume stats outperform efficiency stats. Counting metrics driven by opportunity (REB, AST, PTS) consistently achieved lower relative RMSE values, making them more reliable for projection purposes.
+
+**Best-performing methods.**
+
+- Linear regression (LM) and Exponential weighting (EXP) generally outperform the simple average baseline.
+
+- Optimal lookbacks tend to be 3–5 seasons, balancing recency and sample depth.
+
+**Practical takeaway.**
+
+- Use LM or EXP when sufficient historical depth exists; Equal is only competitive for sparse data.
+
+- Expect higher uncertainty in efficiency-based projections, especially for FT% and FG%.
+
+**Overall conclusion.**
+
+Player performance has measurable inertia: roughly half of season-to-season variance in key per-36 stats can be captured using lightweight, interpretable models.
+
+However, efficiency metrics remain highly context-dependent and are harder to generalize.
